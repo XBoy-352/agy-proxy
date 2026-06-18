@@ -26,6 +26,7 @@ import { readFileSync, accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, delimiter as pathDelimiter } from "node:path";
 import { homedir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -161,6 +162,9 @@ function extractSystemPrompt(messages) {
     .join("\n");
 }
 
+// NOTE: messages are flattened into a plain "System:/User:/Assistant:" text
+// prompt, so a message body containing those role markers can forge turns.
+// Acceptable for a localhost, single-user proxy; revisit if ever exposed.
 function messagesToPrompt(messages) {
   const parts = [];
   const systemContent = extractSystemPrompt(messages);
@@ -232,7 +236,6 @@ function spawnAgy(model, prompt) {
 
   activeProcesses.add(proc);
 
-  const startTime = Date.now();
   let cleaned = false;
   let overallTimer;
 
@@ -261,7 +264,7 @@ function spawnAgy(model, prompt) {
     }
   }, TIMEOUT);
 
-  return { proc, agyModel, startTime, cleanup, clearOverallTimer: () => clearTimeout(overallTimer) };
+  return { proc, cleanup, clearOverallTimer: () => clearTimeout(overallTimer) };
 }
 
 // ── Non-streaming handler ────────────────────────────────────────────────
@@ -274,34 +277,33 @@ function callAgy(model, messages) {
       return reject(err);
     }
 
-    const { proc, agyModel, startTime, cleanup, clearOverallTimer } = ctx;
+    const { proc, cleanup, clearOverallTimer } = ctx;
+    // Decoders buffer partial multibyte UTF-8 sequences across chunk boundaries
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
     let stdout = "";
     let stderr = "";
-    let gotFirstByte = false;
-    let exitCode = null;
 
     proc.stdout.on("data", (d) => {
-      if (!gotFirstByte) {
-        gotFirstByte = true;
-      }
-      stdout += d.toString();
+      stdout += outDecoder.write(d);
     });
 
     proc.stderr.on("data", (d) => {
-      stderr += d.toString();
+      stderr += errDecoder.write(d);
     });
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       activeProcesses.delete(proc);
-      const elapsed = Date.now() - startTime;
-      exitCode = code;
+      stdout += outDecoder.end();
+      stderr += errDecoder.end();
       clearOverallTimer();
       cleanup();
 
       if (code !== 0) {
         stats.errors++;
-        const errMsg = stderr.trim() || `agy exit ${code}`;
-        console.error(`agy exit ${code}: ${sanitizeError(errMsg)}`);
+        const reason = signal ? `agy killed by ${signal}` : `agy exit ${code}`;
+        const errMsg = stderr.trim() || reason;
+        console.error(`${reason}: ${sanitizeError(errMsg)}`);
         reject(new Error(sanitizeError(errMsg)));
       } else {
         resolve(stdout);
@@ -331,12 +333,20 @@ function callAgyStreaming(model, messages, res) {
     return jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
   }
 
-  const { proc, agyModel, startTime, cleanup, clearOverallTimer } = ctx;
+  const { proc, cleanup, clearOverallTimer } = ctx;
+  // Decoder buffers partial multibyte UTF-8 sequences across chunk boundaries
+  const outDecoder = new StringDecoder("utf8");
   let stderr = "";
   let headersSent = false;
-  let totalChars = 0;
-  let lineBuffer = "";
   let hasError = false;
+  let heartbeat = null;
+
+  function stopHeartbeat() {
+    if (heartbeat) {
+      clearInterval(heartbeat);
+      heartbeat = null;
+    }
+  }
 
   function ensureHeaders() {
     if (res.writableEnded || res.destroyed) return false;
@@ -357,38 +367,55 @@ function callAgyStreaming(model, messages, res) {
     return true;
   }
 
+  function sendContent(text) {
+    if (!text || res.writableEnded || res.destroyed) return;
+    sendSSE(res, {
+      id, object: "chat.completion.chunk", created, model,
+      choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+    });
+  }
+
   // Send headers upfront before any data
   ensureHeaders();
 
+  // Optional heartbeat — keeps idle SSE connections alive through proxies/LBs
+  // while agy buffers output (it emits everything at once on completion).
+  if (HEARTBEAT_MS > 0) {
+    heartbeat = setInterval(() => {
+      if (res.writableEnded || res.destroyed) return;
+      res.write(": keepalive\n\n");
+    }, HEARTBEAT_MS);
+    heartbeat.unref?.();
+  }
+
   proc.stdout.on("data", (d) => {
-    const chunk = d.toString();
-    totalChars += chunk.length;
-
-    if (res.writableEnded || res.destroyed) return;
-
-    // Send text as SSE delta
-    sendSSE(res, {
-      id, object: "chat.completion.chunk", created, model,
-      choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-    });
+    sendContent(outDecoder.write(d));
   });
 
   proc.stderr.on("data", (d) => {
     stderr += d.toString();
   });
 
-  proc.on("close", (code) => {
+  proc.on("close", (code, signal) => {
     activeProcesses.delete(proc);
     clearOverallTimer();
+    stopHeartbeat();
     cleanup();
+
+    // Flush any buffered multibyte remainder
+    sendContent(outDecoder.end());
 
     if (code !== 0 && !hasError) {
       hasError = true;
       stats.errors++;
-    }
-
-    // Send stop
-    if (ensureHeaders()) {
+      const reason = signal ? `agy killed by ${signal}` : `agy exit ${code}`;
+      const errMsg = stderr.trim() || reason;
+      console.error(`Streaming ${reason}: ${sanitizeError(errMsg)}`);
+      // Surface the failure to the client instead of a clean stop
+      if (ensureHeaders() && !res.writableEnded && !res.destroyed) {
+        sendSSE(res, { error: { message: sanitizeError(errMsg), type: "proxy_error" } });
+      }
+    } else if (ensureHeaders()) {
       sendSSE(res, {
         id, object: "chat.completion.chunk", created, model,
         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
@@ -403,6 +430,7 @@ function callAgyStreaming(model, messages, res) {
 
   proc.on("error", (err) => {
     hasError = true;
+    stopHeartbeat();
     cleanup();
     stats.errors++;
     console.error(`Streaming error: ${sanitizeError(err.message)}`);
@@ -413,6 +441,15 @@ function callAgyStreaming(model, messages, res) {
         error: { message: sanitizeError(err.message), type: "proxy_error" },
       });
       res.end();
+    }
+  });
+
+  // If the client disconnects mid-stream, kill the child so we don't burn
+  // quota and a process slot running to completion for nobody.
+  res.on("close", () => {
+    stopHeartbeat();
+    if (!proc.killed && proc.exitCode === null) {
+      try { proc.kill("SIGTERM"); } catch {}
     }
   });
 }
@@ -432,19 +469,35 @@ function handleModels(req, res) {
 }
 
 function handleChatCompletions(req, res) {
-  let body = "";
+  const chunks = [];
+  let size = 0;
+  let aborted = false;
+
   req.on("data", (d) => {
-    body += d;
-    if (body.length > MAX_BODY_SIZE) {
+    if (aborted) return;
+    size += d.length; // byte length of the Buffer chunk
+    if (size > MAX_BODY_SIZE) {
+      aborted = true;
       jsonResponse(res, 413, { error: { message: "Request too large", type: "invalid_request_error" } });
       req.destroy();
       return;
     }
+    chunks.push(d);
   });
+
+  req.on("error", () => {
+    if (aborted) return;
+    aborted = true;
+    if (!res.writableEnded && !res.destroyed) {
+      jsonResponse(res, 400, { error: { message: "Request stream error", type: "invalid_request_error" } });
+    }
+  });
+
   req.on("end", async () => {
+    if (aborted) return;
     let parsed;
     try {
-      parsed = JSON.parse(body);
+      parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     } catch {
       return jsonResponse(res, 400, { error: { message: "Invalid JSON body", type: "invalid_request_error" } });
     }
@@ -526,22 +579,24 @@ const server = createServer((req, res) => {
     return res.end();
   }
 
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  // Health checks are exempt from auth so monitoring works with PROXY_API_KEY set
+  if (url.pathname === "/health" || url.pathname === "/v1/health") {
+    return handleHealth(req, res);
+  }
+
   if (!checkAuth(req)) {
     return jsonResponse(res, 401, {
       error: { message: "Unauthorized. Set PROXY_API_KEY or omit for no auth.", type: "auth_error" },
     });
   }
 
-  const url = new URL(req.url, `http://localhost:${PORT}`);
-
   switch (url.pathname) {
     case "/v1/models":
       return handleModels(req, res);
     case "/v1/chat/completions":
       return handleChatCompletions(req, res);
-    case "/health":
-    case "/v1/health":
-      return handleHealth(req, res);
     default:
       jsonResponse(res, 404, {
         error: { message: `Not found: ${url.pathname}`, type: "not_found" },
@@ -549,19 +604,18 @@ const server = createServer((req, res) => {
   }
 });
 
-process.on("SIGTERM", () => {
+function shutdown() {
   for (const proc of activeProcesses) {
     try { proc.kill("SIGKILL"); } catch {}
   }
   server.close(() => process.exit(0));
-});
+  // Force-exit if lingering connections (e.g. open SSE streams) keep the
+  // server from closing cleanly.
+  setTimeout(() => process.exit(0), 5000).unref();
+}
 
-process.on("SIGINT", () => {
-  for (const proc of activeProcesses) {
-    try { proc.kill("SIGKILL"); } catch {}
-  }
-  server.close(() => process.exit(0));
-});
+process.on("SIGTERM", shutdown);
+process.on("SIGINT", shutdown);
 
 server.listen(PORT, "127.0.0.1", () => {
   console.log(`agy-proxy v${JSON.parse(readFileSync(join(__dirname, "package.json"), "utf8")).version}`);
