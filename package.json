@@ -1,0 +1,12 @@
+{
+  "name": "agy-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for Google Antigravity CLI (agy) — spawns the real agy binary so all traffic is identical to the official CLI",
+  "type": "module",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "health": "node -e \"fetch('http://localhost:3457/v1/models').then(r=>r.json()).then(console.log)\""
+  },
+  "license": "MIT"
+}
