@@ -8,5 +8,8 @@
     "start": "node server.mjs",
     "health": "node -e \"fetch('http://localhost:3457/v1/models').then(r=>r.json()).then(console.log)\""
   },
+  "engines": {
+    "node": ">=20"
+  },
   "license": "MIT"
 }
