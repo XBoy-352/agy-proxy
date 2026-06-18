@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Antigravity CLI Proxy
+Comment=OpenAI-compatible proxy for Google Antigravity CLI (agy)
+Exec=node /home/aditya/.agy-proxy/server.mjs
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
+Categories=Utility;

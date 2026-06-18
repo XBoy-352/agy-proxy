@@ -1,0 +1,16 @@
+[Unit]
+Description=Antigravity CLI Proxy (agy)
+Documentation=file:///home/aditya/.agy-proxy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node /home/aditya/.agy-proxy/server.mjs
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
