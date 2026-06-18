@@ -29,7 +29,7 @@ echo ""
 
 # Check agy binary
 if command -v agy &> /dev/null; then
-    echo "✓ agy binary: $(which agy) ($(agy --version 2>&1))"
+    echo "✓ agy binary: $(which agy)"
 else
     echo "✗ agy binary: NOT found in PATH"
 fi

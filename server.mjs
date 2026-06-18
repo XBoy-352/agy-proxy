@@ -12,7 +12,7 @@
  *   AGY_PROXY_PORT       — listen port (default: 3457)
  *   AGY_BIN              — path to agy binary (default: auto-detect via PATH)
  *   AGY_TIMEOUT          — per-request timeout in ms (default: 600000 = 10min)
- *   AGY_SKIP_PERMISSIONS — "false" to require permission prompts (default: true)
+ *   AGY_SKIP_PERMISSIONS — "true" to skip permission prompts (default: false)
  *   AGY_MODEL            — default model if none specified (default: gemini-3.5-flash-medium)
  *   AGY_HEARTBEAT_MS     — SSE heartbeat interval (default: 0 = disabled)
  *   AGY_PRINT_TIMEOUT    — value for --print-timeout flag (default: 10m)
@@ -24,22 +24,36 @@ import { spawn } from "node:child_process";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { readFileSync, accessSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, join, delimiter as pathDelimiter } from "node:path";
+import { homedir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ── Config ───────────────────────────────────────────────────────────────
 const PORT = parseInt(process.env.AGY_PROXY_PORT || "3457", 10);
 const TIMEOUT = parseInt(process.env.AGY_TIMEOUT || "600000", 10); // 10min
-const SKIP_PERMISSIONS = process.env.AGY_SKIP_PERMISSIONS !== "false";
+const SKIP_PERMISSIONS = process.env.AGY_SKIP_PERMISSIONS === "true";
 const HEARTBEAT_MS = parseInt(process.env.AGY_HEARTBEAT_MS || "0", 10);
 const PRINT_TIMEOUT = process.env.AGY_PRINT_TIMEOUT || "10m";
 const API_KEY = process.env.PROXY_API_KEY || null;
 const DEFAULT_MODEL = process.env.AGY_MODEL || "gemini-3.5-flash-medium";
+const MAX_BODY_SIZE = 1024 * 1024; // 1MB
+
+// Validate PRINT_TIMEOUT format
+if (!/^\d+[smh]$/.test(PRINT_TIMEOUT)) {
+  console.error(`Invalid AGY_PRINT_TIMEOUT: ${PRINT_TIMEOUT}. Use format like "10m", "1h", "30s"`);
+  process.exit(1);
+}
 
 // Resolve agy binary
 const AGY = resolveAgy();
-const modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
+let modelsConfig;
+try {
+  modelsConfig = JSON.parse(readFileSync(join(__dirname, "models.json"), "utf8"));
+} catch (err) {
+  console.error(`FATAL: Failed to load models.json: ${sanitizeError(err.message)}`);
+  process.exit(1);
+}
 
 // Build model map: API ID → agy model name
 const MODEL_MAP = {};
@@ -75,7 +89,7 @@ function resolveAgy() {
   }
 
   // Search PATH
-  const pathDirs = (process.env.PATH || "").split(":");
+  const pathDirs = (process.env.PATH || "").split(pathDelimiter);
   for (const dir of pathDirs) {
     const candidate = join(dir, "agy");
     try {
@@ -85,7 +99,7 @@ function resolveAgy() {
   }
 
   // Check common locations
-  const home = process.env.HOME || "/home/aditya";
+  const home = process.env.HOME || homedir();
   const common = [
     join(home, ".local/bin/agy"),
     "/usr/local/bin/agy",
@@ -154,7 +168,8 @@ function messagesToPrompt(messages) {
     parts.push(`System: ${systemContent}`);
   }
 
-  const nonSystem = messages.filter(m => m.role !== "system");
+  // Skip tool/function messages — they're for OpenAI tool calling, not plain text prompts
+  const nonSystem = messages.filter(m => m.role !== "system" && m.role !== "tool" && m.role !== "function");
   for (const msg of nonSystem) {
     const role = msg.role === "user" ? "User" : "Assistant";
     const content = extractTextContent(msg);
@@ -211,6 +226,8 @@ function spawnAgy(model, prompt) {
     env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+
+  activeProcesses.add(proc);
 
   const startTime = Date.now();
   let cleaned = false;
@@ -335,13 +352,14 @@ function callAgyStreaming(model, messages, res) {
     return true;
   }
 
+  // Send headers upfront before any data
   ensureHeaders();
 
   proc.stdout.on("data", (d) => {
     const chunk = d.toString();
     totalChars += chunk.length;
 
-    if (!ensureHeaders()) return;
+    if (res.writableEnded || res.destroyed) return;
 
     // Send text as SSE delta
     sendSSE(res, {
@@ -406,7 +424,13 @@ function handleModels(req, res) {
 
 function handleChatCompletions(req, res) {
   let body = "";
-  req.on("data", (d) => { body += d; });
+  req.on("data", (d) => {
+    body += d;
+    if (body.length > MAX_BODY_SIZE) {
+      req.destroy();
+      return jsonResponse(res, 413, { error: { message: "Request too large", type: "invalid_request_error" } });
+    }
+  });
   req.on("end", async () => {
     let parsed;
     try {
@@ -492,7 +516,7 @@ const server = createServer((req, res) => {
     });
   }
 
-  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+  const url = new URL(req.url, `http://localhost:${PORT}`);
 
   switch (url.pathname) {
     case "/v1/models":
