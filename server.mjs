@@ -220,6 +220,9 @@ function spawnAgy(model, prompt) {
   delete env.AGY_TIMEOUT;
   delete env.AGY_BIN;
   delete env.AGY_HEARTBEAT_MS;
+  delete env.AGY_SKIP_PERMISSIONS;
+  delete env.AGY_MODEL;
+  delete env.AGY_PRINT_TIMEOUT;
   delete env.PROXY_API_KEY;
 
   const proc = spawn(AGY, cliArgs, {
@@ -231,6 +234,7 @@ function spawnAgy(model, prompt) {
 
   const startTime = Date.now();
   let cleaned = false;
+  let overallTimer;
 
   function cleanup() {
     if (cleaned) return;
@@ -247,7 +251,7 @@ function spawnAgy(model, prompt) {
   proc.stdin.end();
 
   // Overall timeout
-  const overallTimer = setTimeout(() => {
+  overallTimer = setTimeout(() => {
     if (!cleaned) {
       stats.timeouts++;
       try { proc.kill("SIGTERM"); } catch {}
@@ -297,9 +301,10 @@ function callAgy(model, messages) {
       if (code !== 0) {
         stats.errors++;
         const errMsg = stderr.trim() || `agy exit ${code}`;
+        console.error(`agy exit ${code}: ${sanitizeError(errMsg)}`);
         reject(new Error(sanitizeError(errMsg)));
       } else {
-        resolve(stdout.trim());
+        resolve(stdout);
       }
     });
 
@@ -400,9 +405,13 @@ function callAgyStreaming(model, messages, res) {
     hasError = true;
     cleanup();
     stats.errors++;
+    console.error(`Streaming error: ${sanitizeError(err.message)}`);
     if (!headersSent) {
       jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
     } else if (!res.writableEnded && !res.destroyed) {
+      sendSSE(res, {
+        error: { message: sanitizeError(err.message), type: "proxy_error" },
+      });
       res.end();
     }
   });
@@ -427,8 +436,9 @@ function handleChatCompletions(req, res) {
   req.on("data", (d) => {
     body += d;
     if (body.length > MAX_BODY_SIZE) {
+      jsonResponse(res, 413, { error: { message: "Request too large", type: "invalid_request_error" } });
       req.destroy();
-      return jsonResponse(res, 413, { error: { message: "Request too large", type: "invalid_request_error" } });
+      return;
     }
   });
   req.on("end", async () => {
@@ -446,7 +456,12 @@ function handleChatCompletions(req, res) {
     }
 
     const model = reqModel || DEFAULT_MODEL;
-    const effectiveModel = MODEL_MAP[model] ? model : DEFAULT_MODEL;
+    if (!MODEL_MAP[model]) {
+      return jsonResponse(res, 400, {
+        error: { message: `Unknown model: "${model}". Use /v1/models to list available models.`, type: "invalid_request_error" },
+      });
+    }
+    const effectiveModel = model;
 
     stats.totalRequests++;
 
@@ -477,6 +492,7 @@ function handleChatCompletions(req, res) {
           },
         });
       } catch (err) {
+        console.error(`Completion error: ${sanitizeError(err.message)}`);
         jsonResponse(res, 500, { error: { message: sanitizeError(err.message), type: "proxy_error" } });
       }
     }

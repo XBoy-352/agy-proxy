@@ -41,7 +41,7 @@ curl http://127.0.0.1:3457/health
 | `AGY_PROXY_PORT` | 3457 | Listen port |
 | `AGY_BIN` | auto-detect | Path to agy binary |
 | `AGY_TIMEOUT` | 600000 | Request timeout (ms) |
-| `AGY_SKIP_PERMISSIONS` | true | Auto-approve permissions |
+| `AGY_SKIP_PERMISSIONS` | false | Auto-approve permissions |
 | `AGY_MODEL` | gemini-3.5-flash-medium | Default model |
 | `AGY_HEARTBEAT_MS` | 0 | SSE heartbeat interval |
 | `AGY_PRINT_TIMEOUT` | 10m | agy --print-timeout value |
